@@ -423,6 +423,37 @@ def is_ancestor(objects, ancestor_oid, tip_oid):
     return ancestor_oid in set(commit_ancestors(objects, tip_oid))
 
 
+def parse_tag(data):
+    """Parse an annotated tag object into its fields."""
+    text = data.decode('utf-8', 'replace')
+    head, _, message = text.partition('\n\n')
+    fields = {}
+    for line in head.split('\n'):
+        if ' ' in line:
+            key, _, value = line.partition(' ')
+            fields[key] = value
+    return {'object': fields.get('object', ''), 'type': fields.get('type', ''),
+            'tag': fields.get('tag', ''), 'tagger': fields.get('tagger', ''),
+            'message': message}
+
+
+def peel_to_commit(objects, oid):
+    """Follow tag objects to the commit they point at (None if not found)."""
+    seen = set()
+    while oid and oid not in seen:
+        seen.add(oid)
+        entry = objects.get(oid)
+        if entry is None:
+            return None
+        if entry[0] == 'commit':
+            return oid
+        if entry[0] == 'tag':
+            oid = parse_tag(entry[1])['object']
+            continue
+        return None
+    return None
+
+
 def merge_base(objects, oid_a, oid_b):
     """Nearest common ancestor of two commits (linear histories: exact)."""
     if not oid_a or not oid_b:
@@ -605,11 +636,27 @@ def _read_ofs_delta_offset(data, pos):
     return offset, pos
 
 
+def _read_delta_varint(data, pos):
+    """Delta header varint (source/target size): 7 bits per byte,
+    little-endian, MSB set means "more bytes follow". This is NOT the
+    pack-entry size varint (which packs 4 bits into the first byte)."""
+    value = 0
+    shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not (byte & 0x80):
+            break
+    return value, pos
+
+
 def apply_delta(base, delta):
     """Apply a git delta to base bytes; returns the result bytes."""
     pos = 0
-    _src_size, pos = _read_varint(delta, pos)
-    dst_size, pos = _read_varint(delta, pos)
+    _src_size, pos = _read_delta_varint(delta, pos)
+    dst_size, pos = _read_delta_varint(delta, pos)
     out = bytearray()
     while pos < len(delta):
         op = delta[pos]
@@ -751,7 +798,9 @@ def build_pack(objects):
                 byte |= 0x80
             header.append(byte)
         out += header
-        out += zlib.compress(payload)
+        # Level 1: the pack is a transport encoding, not storage — the
+        # client only needs the objects, so trade size for CPU time.
+        out += zlib.compress(payload, 1)
     trailer = hashlib.sha1(bytes(out)).digest()
     out += trailer
     return bytes(out)
@@ -813,22 +862,10 @@ def collect_fetch_objects(objects, wants, haves, depth, prev_shallow=None):
         elif entry[0] == 'tree':
             for _mode, _name, child in parse_tree(entry[1]):
                 stack.append(child)
-    while stack:
-        oid = stack.pop()
-        if oid in reachable:
-            continue
-        entry = objects.get(oid)
-        if entry is None:
-            continue
-        reachable.add(oid)
-        if entry[0] == 'commit':
-            tree = parse_commit(entry[1])['tree']
-            if tree:
-                stack.append(tree)
-        elif entry[0] == 'tree':
-            for _mode, _name, child in parse_tree(entry[1]):
-                stack.append(child)
-    # Subtract everything reachable from the haves.
+    # Subtract everything reachable from the haves. A shallow boundary the
+    # client already holds is a leaf: the client has that commit but NOT its
+    # parents, so the walk must not cross it — otherwise a deepen fetch
+    # would subtract the very objects it has to deliver.
     if haves:
         have_reachable = set()
         stack = list(haves)
@@ -844,8 +881,9 @@ def collect_fetch_objects(objects, wants, haves, depth, prev_shallow=None):
                 tree = parse_commit(entry[1])['tree']
                 if tree:
                     stack.append(tree)
-                for parent in parse_commit(entry[1])['parents']:
-                    stack.append(parent)
+                if oid not in prev_shallow:
+                    for parent in parse_commit(entry[1])['parents']:
+                        stack.append(parent)
             elif entry[0] == 'tree':
                 for _mode, _name, child in parse_tree(entry[1]):
                     stack.append(child)
@@ -1185,6 +1223,26 @@ class ForgeHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     server_version = 'github-core-clone/1.0.0'
 
+    def setup(self):
+        super().setup()
+        # Disable Nagle: the perf workloads are thousands of sequential
+        # small requests on one keep-alive connection, and the Nagle /
+        # delayed-ACK interaction stalls each pair by ~40 ms.
+        # TCP_QUICKACK is the other half: the Node client writes request
+        # headers and body in separate segments, and its Nagle blocks the
+        # body until our ACK of the headers arrives; acknowledging at once
+        # (instead of the kernel's 40 ms delayed ACK) unblocks it.
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP,
+                                       socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP,
+                                       socket.TCP_QUICKACK, 1)
+        except Exception:
+            pass
+
     # -- quiet logging ------------------------------------------------------
     def log_message(self, fmt, *args):
         pass
@@ -1215,16 +1273,40 @@ class ForgeHandler(BaseHTTPRequestHandler):
         self._json(status, {'message': message})
 
     def _read_body(self):
-        length = self.headers.get('Content-Length')
-        if length is None:
-            return b''
-        try:
-            n = int(length)
-        except ValueError:
-            return b''
-        if n <= 0:
-            return b''
-        return self.rfile.read(n)
+        """Read (and cache) the request body. Cached so an early error
+        reply (401/404) still consumes the body — otherwise the unread
+        bytes are parsed as the next request on a keep-alive connection
+        and the whole connection pool desyncs."""
+        if getattr(self, '_body_cache', None) is not None:
+            return self._body_cache
+        data = b''
+        te = self.headers.get('Transfer-Encoding', '')
+        if 'chunked' in te.lower():
+            while True:
+                line = self.rfile.readline(65536)
+                try:
+                    size = int(line.strip().split(b';')[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline(65536)
+                        if trailer in (b'\r\n', b'\n', b''):
+                            break
+                    break
+                data += self.rfile.read(size)
+                self.rfile.readline(65536)  # CRLF after the chunk
+        else:
+            length = self.headers.get('Content-Length')
+            if length is not None:
+                try:
+                    n = int(length)
+                except ValueError:
+                    n = 0
+                if n > 0:
+                    data = self.rfile.read(n)
+        self._body_cache = data
+        return data
 
     def _read_json(self):
         """Returns (obj, None) or (None, error_message)."""
@@ -1293,11 +1375,19 @@ class ForgeHandler(BaseHTTPRequestHandler):
 
     # -- router -------------------------------------------------------------
     def _route(self, method):
+        # A keep-alive connection reuses this handler instance for many
+        # requests; the body cache is per-request, not per-connection.
+        self._body_cache = None
         try:
             parts, query, raw_path = self._path_parts()
         except Exception:
             self._err(400, 'bad request path')
             return
+        # Consume the body up front (cached by _read_body): a request that
+        # is answered early (401/404) must not leave its body unread, or
+        # the next request on the keep-alive connection is mis-parsed.
+        if method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            self._read_body()
         try:
             if raw_path == '/healthz' and method == 'GET':
                 self._json(200, {'ok': True})
@@ -1952,6 +2042,13 @@ class ForgeHandler(BaseHTTPRequestHandler):
         with STORE.lock:
             refs = sorted(repo.refs.items())
             default_tip = repo.head_commit()
+            peeled = {}
+            for ref, oid in refs:
+                entry = repo.objects.get(oid)
+                if entry is not None and entry[0] == 'tag':
+                    target = peel_to_commit(repo.objects, oid)
+                    if target:
+                        peeled[ref] = target
         if service == 'git-upload-pack':
             caps = ('symref=HEAD:refs/heads/main side-band-64k ofs-delta '
                     'shallow')
@@ -1970,6 +2067,8 @@ class ForgeHandler(BaseHTTPRequestHandler):
             out += pkt_line('%s HEAD\0%s\n' % (tip, caps))
             for ref, oid in refs:
                 out += pkt_line('%s %s\n' % (oid, ref))
+                if ref in peeled:
+                    out += pkt_line('%s %s^{}\n' % (peeled[ref], ref))
         out += PKT_FLUSH
         self._send(200, bytes(out), ctype)
 
@@ -2017,6 +2116,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def _git_ls_refs(self, repo, args):
         symrefs = 'symrefs' in args
         unborn = 'unborn' in args
+        peel = 'peel' in args
         prefixes = [a[len('ref-prefix '):] for a in args
                     if a.startswith('ref-prefix ')]
         with STORE.lock:
@@ -2031,13 +2131,13 @@ class ForgeHandler(BaseHTTPRequestHandler):
             out.extend(pkt_line('%s %s%s\n' % (oid, name, attrs)))
 
         if not refs:
-            if unborn:
-                if keep('HEAD'):
-                    attrs = (' symref-target:refs/heads/main'
-                             if symrefs else '')
-                    emit('unborn', 'HEAD', attrs)
-                if keep('refs/heads/main'):
-                    emit('unborn', 'refs/heads/main')
+            # Real git answers an empty repo with only the unborn HEAD
+            # line; an `unborn refs/heads/main` line would be read as a
+            # real ref by the client.
+            if unborn and keep('HEAD'):
+                attrs = (' symref-target:refs/heads/main'
+                         if symrefs else '')
+                emit('unborn', 'HEAD', attrs)
         else:
             if keep('HEAD'):
                 attrs = (' symref-target:refs/heads/main'
@@ -2045,7 +2145,14 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 emit(default_tip, 'HEAD', attrs)
             for ref, oid in refs:
                 if keep(ref):
-                    emit(oid, ref)
+                    attrs = ''
+                    if peel:
+                        entry = repo.objects.get(oid)
+                        if entry is not None and entry[0] == 'tag':
+                            target = peel_to_commit(repo.objects, oid)
+                            if target:
+                                attrs = ' peeled:' + target
+                    emit(oid, ref, attrs)
         out += PKT_FLUSH
         self._send(200, bytes(out), 'application/x-git-upload-pack-result')
 
@@ -2196,22 +2303,31 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 return False, 'non-fast-forward'
             del repo.refs[ref]
             return True, ''
+        # The new object must be a commit for branches; a tag ref may
+        # point at an annotated tag object (or a commit) instead.
+        entry = repo.objects.get(new)
+        if entry is None:
+            return False, 'object not found'
+        if ref.startswith('refs/tags/'):
+            if entry[0] not in ('commit', 'tag'):
+                return False, 'object not found'
+        elif entry[0] != 'commit':
+            return False, 'object not found'
         if old == ZERO_OID:
             if current is not None:
                 return False, 'already exists'
-            entry = repo.objects.get(new)
-            if entry is None or entry[0] != 'commit':
-                return False, 'object not found'
             repo.refs[ref] = new
             return True, ''
         if current is None:
             return False, 'remote ref does not exist'
         if current != old:
             return False, 'non-fast-forward'
-        entry = repo.objects.get(new)
-        if entry is None or entry[0] != 'commit':
+        # Fast-forward check on the peeled commits (a tag's target).
+        new_commit = peel_to_commit(repo.objects, new)
+        old_commit = peel_to_commit(repo.objects, old)
+        if new_commit is None or old_commit is None:
             return False, 'object not found'
-        if not is_ancestor(repo.objects, old, new):
+        if not is_ancestor(repo.objects, old_commit, new_commit):
             return False, 'non-fast-forward'
         repo.refs[ref] = new
         return True, ''
@@ -3299,6 +3415,13 @@ def _register(port):
         attempt += 1
 
 
+class ForgeServer(ThreadingHTTPServer):
+    # The clone workload opens 50 connections at once; the default
+    # listen backlog (5) drops most of them and the clients retry.
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def _wait_for_done():
     attempt = 0
     while True:
@@ -3314,8 +3437,7 @@ def _wait_for_done():
 
 
 def main():
-    server = ThreadingHTTPServer(('0.0.0.0', 0), ForgeHandler)
-    server.daemon_threads = True
+    server = ForgeServer(('0.0.0.0', 0), ForgeHandler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
